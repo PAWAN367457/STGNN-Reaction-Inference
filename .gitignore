@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights
+*.pt
+
+# Numpy outputs / inference results
+*.npy
+*.npz
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
