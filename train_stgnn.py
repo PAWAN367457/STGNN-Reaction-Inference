@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import os
 
 from stgnn_dataset import STGNNReactionDataset
 from stgnn_model import STGNNModel
-from models import FaceMotionTokenizerV2
 
 
 # ======================
@@ -18,21 +18,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 DMM_META = "rewritten_metadata/video_3dmm_features_metadata.csv"
 AUDIO_META = "rewritten_metadata/audio_features_metadata.csv"
-TOKENIZER_CKPT = "best_tokenizer_fsq_256_v2.pt"
 NORM_STATS = "norm_stats.pt"
 
-MAX_FRAMES = 300
-
-
-# ======================
-# Padding helper
-# ======================
-def pad_time(x, target_len):
-    B, T, D = x.shape
-    if T >= target_len:
-        return x[:, :target_len]
-    pad = torch.zeros(B, target_len - T, D, device=x.device)
-    return torch.cat([x, pad], dim=1)
+PAST_FRAMES = 150
 
 
 # ======================
@@ -45,53 +33,29 @@ std = norm["std"]
 if mean.shape[0] < 181:
     pad = 181 - mean.shape[0]
     mean = torch.cat([mean, torch.zeros(pad)])
-    std = torch.cat([std, torch.ones(pad)])
+    std  = torch.cat([std, torch.ones(pad)])
 
 mean = mean.to(DEVICE)
-std = std.to(DEVICE)
+std  = std.to(DEVICE)
 
 def normalize(x):
     return (x - mean) / std
 
 
 # ======================
-# Tokenizer (FROZEN)
-# ======================
-tokenizer = FaceMotionTokenizerV2(
-    input_dim=181,
-    down_t=3,
-    stride_t=2,
-    quantizer="fsq",
-    embed=256,
-    levels=[8, 5, 5]
-).to(DEVICE)
-
-ckpt = torch.load(TOKENIZER_CKPT, map_location=DEVICE)
-tokenizer.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in ckpt.items()})
-tokenizer.eval()
-
-for p in tokenizer.parameters():
-    p.requires_grad = False
-
-print(" Tokenizer loaded and frozen")
-
-
-# ======================
 # Dataset + Loader
 # ======================
-def collate_skip_none(batch):
+def collate_fn(batch):
     batch = [b for b in batch if b is not None]
     if len(batch) == 0:
         return None
 
-    speaker = torch.stack([b["speaker_past"] for b in batch])      # (B,150,181)
+    speaker = torch.stack([b["speaker_past"] for b in batch])
     listener1 = torch.stack([b["listener_future"][0] for b in batch])
     listener2 = torch.stack([b["listener_future"][1] for b in batch])
 
-    # Rebuild full motion tensor: (B,3,150,181)
     motion = torch.stack([speaker, listener1, listener2], dim=1)
-
-    audio = torch.stack([b["audio_past"] for b in batch])          # (B,150,768)
+    audio = torch.stack([b["audio_past"] for b in batch])
 
     return {
         "motion": motion,
@@ -110,7 +74,7 @@ train_loader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=True,
     num_workers=4,
-    collate_fn=collate_skip_none
+    collate_fn=collate_fn
 )
 
 
@@ -123,50 +87,44 @@ criterion = nn.L1Loss()
 
 
 # ======================
-# Training loop
+# Velocity Loss
 # ======================
-best_loss = float("inf")
-
 def velocity_loss(pred, gt):
-    """
-    pred, gt: (B, 2, T, 181)
-    """
     pred_v = pred[:, :, 1:] - pred[:, :, :-1]
     gt_v   = gt[:, :, 1:] - gt[:, :, :-1]
     return torch.mean(torch.abs(pred_v - gt_v))
 
+
+# ======================
+# Training Loop
+# ======================
+best_loss = float("inf")
 
 for epoch in range(EPOCHS):
     model.train()
     total_loss = 0.0
 
     for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
+
         if batch is None:
             continue
 
-        motion_raw = batch["motion"].to(DEVICE)
+        motion_raw = batch["motion"].to(DEVICE)  # (B,3,T,181)
         audio = batch["audio"].to(DEVICE)
 
-        with torch.no_grad():
-            B, N, T, D = motion_raw.shape
-            motion_clean = torch.zeros_like(motion_raw)
+        # Normalize directly
+        motion_norm = normalize(motion_raw)
 
-            for n in range(N):
-                norm_m = normalize(motion_raw[:, n])
-                clean_m, _ = tokenizer(norm_m)
-                clean_m = pad_time(clean_m, T)
-                motion_clean[:, n] = clean_m
+        # Forward
+        pred = model(motion_norm, audio)
 
-        pred = model(motion_clean, audio)
-
-        pred_listener = pred[:, 1:]           # (B,2,T,181)
-        gt_listener   = motion_clean[:, 1:]
+        pred_listener = pred[:, 1:]
+        gt_listener   = motion_norm[:, 1:]
 
         loss_pos = criterion(pred_listener, gt_listener)
         loss_vel = velocity_loss(pred_listener, gt_listener)
 
         loss = loss_pos + 0.5 * loss_vel
-
 
         optimizer.zero_grad()
         loss.backward()
@@ -176,8 +134,13 @@ for epoch in range(EPOCHS):
 
     avg_loss = total_loss / len(train_loader)
     print(f"Epoch {epoch+1} | Train Loss: {avg_loss:.6f}")
+    checkpoint_dir = 'checkpoints'
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     if avg_loss < best_loss:
         best_loss = avg_loss
-        torch.save(model.state_dict(), "stgnn_best.pt")
-        print(" Saved best model")
+        torch.save(model.state_dict(), "checkpoints/stgnn_no_tokenizer_best.pt")
+        print("✅ Saved best model")
+
+print("🎉 Training complete")
